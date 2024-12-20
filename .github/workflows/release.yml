@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Get version
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+  validate:
+    name: Validate Release
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Validate version in pubspec
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          PUBSPEC_VERSION=$(grep 'version:' pubspec.yaml | cut -d' ' -f2)
+          if [ "$VERSION" != "$PUBSPEC_VERSION" ]; then
+            echo "Version mismatch: Tag is $VERSION but pubspec has $PUBSPEC_VERSION"
+            exit 1
+          fi
+          
+      - name: Validate changelog
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          if ! grep -q "\[$VERSION\]" CHANGELOG.md; then
+            echo "Changelog entry for version $VERSION not found"
+            exit 1
+          fi
+
+  build:
+    name: Build Release
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.0'
+          channel: 'stable'
+          
+      - name: Install dependencies
+        run: flutter pub get
+        
+      - name: Build Android
+        run: flutter build apk --release
+        
+      - name: Build Web
+        run: flutter build web --release
+        
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-artifacts
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/web/
+
+  test:
+    name: Test Release
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.0'
+          channel: 'stable'
+          
+      - name: Install dependencies
+        run: flutter pub get
+        
+      - name: Run tests
+        run: flutter test --coverage
+        
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  deploy:
+    name: Deploy Release
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-artifacts
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            app-release.apk
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          
+      - name: Deploy to Play Store
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_CONFIG }}
+          packageName: com.grade8prep.app
+          releaseFiles: app-release.apk
+          track: production
+          
+      - name: Deploy to Firebase
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          projectId: grade-8-prep
+          channelId: live
+
+  notify:
+    name: Send Notifications
+    needs: deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+          text: "New release ${{ needs.prepare.outputs.version }} deployed! 🚀"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "New Release: v${{ needs.prepare.outputs.version }}"
+          body: "A new version of Grade 8 Prep has been released!"
+          to: team@grade8prep.com
+          from: CI/CD Pipeline
